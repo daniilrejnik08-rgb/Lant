@@ -31,6 +31,14 @@ LOG_CHANNEL_ID = 1506392661454487822
 APPLICATIONS_LOG_CHANNEL_ID = 1513721222578311279
 AUDIT_CHANNEL_ID = 1506392661454487822
 
+# Приветствие / авто-роль (поставь свои ID; 0 = выключено)
+WELCOME_CHANNEL_ID = 0  # канал для приветствий
+AUTOROLE_ID = 0         # роль при входе
+
+# Steam (опционально: https://steamcommunity.com/dev/apikey)
+STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")
+REQUIRE_STEAM_FOR_APPLICATION = False  # True = нельзя подать заявку без /link steam
+
 BANNER_URL = "https://media.discordapp.net/attachments/1500474195623149764/1505932228461334609/zxc.png?ex=6a0c6c2e&is=6a0b1aae&hm=ece545622b439fef92262fb1d0b10bc2f5e84785a2613cdc7feae759e772f325&=&format=webp&quality=lossless"
 RUBANNER_URL = "https://media.discordapp.net/attachments/1500475963585073264/1512470605172179024/rules.jpg?ex=6a243584&is=6a22e404&hm=1b7c6e512e721bb1cf09568a00af6825bd27f55cc8492cbc5c65c5095110f16a&=&format=webp"
 SEPARATOR_URL = "https://media.discordapp.net/attachments/1500474195623149764/1505936040622424234/zxc2.png?ex=6a0c6fbb&is=6a0b1e3b&hm=0bdbd5aaee6b20782b84216208e4c6096d3fcbbe00edefc78e4b4f91080fd464&=&format=webp&quality=lossless"
@@ -109,8 +117,17 @@ class DataStore:
             "ticket_owners": {},
             "ticket_opened_at": {},
             "blacklist": [],
+            "reaction_roles": {},  # message_id -> {emoji: role_id}
+            "steam_links": {},     # user_id -> steamid64
+            "staff_ratings": {},   # staff_id -> [scores]
         }
         self.load()
+        if "reaction_roles" not in self.data:
+            self.data["reaction_roles"] = {}
+        if "steam_links" not in self.data:
+            self.data["steam_links"] = {}
+        if "staff_ratings" not in self.data:
+            self.data["staff_ratings"] = {}
         self.flood: dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 
     def load(self):
@@ -169,6 +186,43 @@ class DataStore:
 
     def count_open_tickets(self, user_id: int) -> int:
         return sum(1 for uid in self.data.get("ticket_owners", {}).values() if int(uid) == user_id)
+
+    def rr_bind(self, message_id: int, emoji: str, role_id: int) -> None:
+        mid = str(message_id)
+        self.data.setdefault("reaction_roles", {}).setdefault(mid, {})[emoji] = role_id
+        self.save()
+
+    def rr_unbind(self, message_id: int, emoji: str) -> bool:
+        mid = str(message_id)
+        roles = self.data.get("reaction_roles", {}).get(mid, {})
+        if emoji in roles:
+            del roles[emoji]
+            if not roles:
+                self.data["reaction_roles"].pop(mid, None)
+            self.save()
+            return True
+        return False
+
+    def rr_get(self, message_id: int) -> dict:
+        return self.data.get("reaction_roles", {}).get(str(message_id), {})
+
+    def set_steam(self, user_id: int, steamid64: str) -> None:
+        self.data.setdefault("steam_links", {})[str(user_id)] = steamid64
+        self.save()
+
+    def get_steam(self, user_id: int):
+        return self.data.get("steam_links", {}).get(str(user_id))
+
+    def add_rating(self, staff_id: int, score: int) -> None:
+        key = str(staff_id)
+        self.data.setdefault("staff_ratings", {}).setdefault(key, []).append(score)
+        self.save()
+
+    def rating_stats(self, staff_id: int):
+        arr = self.data.get("staff_ratings", {}).get(str(staff_id), [])
+        if not arr:
+            return 0, 0.0
+        return len(arr), sum(arr) / len(arr)
 
 
 store = DataStore(DATA_FILE)
@@ -439,6 +493,108 @@ class DeclineReasonModal(discord.ui.Modal, title="Причина отказа"):
         await self.review_view._resolve(interaction, accepted=False, reason=self.reason.value)
 
 
+
+def parse_steam_input(raw: str) -> str | None:
+    """Из URL / steamID64 / vanity — по возможности вернуть steamID64 (только цифры 17)."""
+    raw = raw.strip()
+    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", raw)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"\d{17}", raw):
+        return raw
+    m = re.search(r"steamcommunity\.com/id/([\w\-]+)", raw)
+    if m:
+        return f"vanity:{m.group(1)}"  # резолвим позже через API
+    if re.fullmatch(r"[\w\-]{2,64}", raw):
+        return f"vanity:{raw}"
+    return None
+
+
+async def resolve_steamid64(value: str) -> str | None:
+    if value.startswith("vanity:"):
+        vanity = value[7:]
+        if not STEAM_API_KEY:
+            return None
+        url = (
+            "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/"
+            f"?key={STEAM_API_KEY}&vanityurl={vanity}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+            r = data.get("response", {})
+            if r.get("success") == 1:
+                return str(r.get("steamid"))
+        except Exception as e:
+            log.warning(f"Steam vanity resolve: {e}")
+        return None
+    return value if re.fullmatch(r"\d{17}", value or "") else None
+
+
+async def fetch_steam_bans(steamid64: str) -> dict | None:
+    if not STEAM_API_KEY:
+        return None
+    url = (
+        "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/"
+        f"?key={STEAM_API_KEY}&steamids={steamid64}"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
+        players = data.get("players") or []
+        return players[0] if players else None
+    except Exception as e:
+        log.warning(f"Steam bans: {e}")
+        return None
+
+
+class TicketRatingView(discord.ui.View):
+    def __init__(self, staff_id: int):
+        super().__init__(timeout=None)
+        self.staff_id = staff_id
+
+    async def _rate(self, interaction: discord.Interaction, score: int):
+        store.add_rating(self.staff_id, score)
+        for c in self.children:
+            c.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            f"⭐ Спасибо! Ваша оценка: **{score}/5**",
+            ephemeral=True,
+        )
+        await _audit(
+            interaction.guild if interaction.guild else None,
+            f"Оценка тикета {score}/5",
+            interaction.user,
+            f"стафф ID {self.staff_id}",
+        )
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, custom_id="rate_1", row=0)
+    async def r1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._rate(interaction, 1)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, custom_id="rate_2", row=0)
+    async def r2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._rate(interaction, 2)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, custom_id="rate_3", row=0)
+    async def r3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._rate(interaction, 3)
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, custom_id="rate_4", row=0)
+    async def r4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._rate(interaction, 4)
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.success, custom_id="rate_5", row=0)
+    async def r5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._rate(interaction, 5)
+
+
 class ApplicationModal(discord.ui.Modal, title="📋 Заявка на должность"):
     nick = discord.ui.TextInput(label="Имя / Ник", placeholder="Введите ваш ник", max_length=64)
     age = discord.ui.TextInput(label="Возраст", placeholder="Введите ваш возраст", max_length=3)
@@ -464,6 +620,14 @@ class ApplicationModal(discord.ui.Modal, title="📋 Заявка на долж�
     async def on_submit(self, interaction: discord.Interaction):
         if store.is_blacklisted(interaction.user.id):
             await interaction.response.send_message("❌ Вы в чёрном списке.", ephemeral=True)
+            return
+
+        steam_id = store.get_steam(interaction.user.id)
+        if REQUIRE_STEAM_FOR_APPLICATION and not steam_id:
+            await interaction.response.send_message(
+                "❌ Сначала привяжите Steam: `/link steam <ссылка или steamID64>`",
+                ephemeral=True,
+            )
             return
 
         uid = str(interaction.user.id)
@@ -494,6 +658,19 @@ class ApplicationModal(discord.ui.Modal, title="📋 Заявка на долж�
         embed.add_field(name="🪪 Ник", value=self.nick.value, inline=True)
         embed.add_field(name="🎂 Возраст", value=self.age.value, inline=True)
         embed.add_field(name="🏷️ Должность", value=self.role_choice, inline=True)
+        steam_id = store.get_steam(interaction.user.id)
+        steam_txt = f"[`{steam_id}`](https://steamcommunity.com/profiles/{steam_id})" if steam_id else "не привязан"
+        embed.add_field(name="🎮 Steam", value=steam_txt, inline=True)
+        if steam_id and STEAM_API_KEY:
+            bans = await fetch_steam_bans(steam_id)
+            if bans:
+                vac = "да" if bans.get("VACBanned") else "нет"
+                game_bans = bans.get("NumberOfGameBans", 0)
+                embed.add_field(
+                    name="🛡️ VAC / Game bans",
+                    value=f"VAC: **{vac}** · Game bans: **{game_bans}**",
+                    inline=False,
+                )
         embed.add_field(name="​", value="​", inline=True)
         embed.add_field(name="📖 Опыт", value=self.experience.value, inline=False)
         embed.add_field(name="⏱️ Время на проект", value=self.time_ready.value, inline=False)
@@ -929,6 +1106,16 @@ async def _close_ticket(interaction: discord.Interaction, reason: str = ""):
                 else:
                     f = discord.File(io.BytesIO(transcript_text.encode("utf-8")), filename="transcript.txt")
                     await owner.send(embed=dm_emb, file=f)
+                # Оценка работы стаффа
+                try:
+                    rate_emb = discord.Embed(
+                        title="⭐ Оцените работу поддержки",
+                        description="Насколько быстро и полезно вам помогли? (1 — плохо, 5 — отлично)",
+                        color=0xFEE75C,
+                    )
+                    await owner.send(embed=rate_emb, view=TicketRatingView(staff_id=interaction.user.id))
+                except Exception:
+                    pass
             except discord.Forbidden:
                 pass
 
@@ -963,6 +1150,7 @@ class Bot(commands.Bot):
         self.add_view(TicketControlView())
         self.add_view(ApplicationView())
         self.add_view(ApplicationReviewView(applicant_id=0))
+        self.add_view(TicketRatingView(staff_id=0))
         self.auto_close_tickets.start()
         self.check_stale_applications.start()
         self.user_reminders.start()
@@ -1132,6 +1320,41 @@ async def on_ready():
         )
     except Exception as e:
         log.error(f"[Bot] Ошибка sync команд: {type(e).__name__}: {e}")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.guild.id != GUILD_ID:
+        return
+    # Авто-роль
+    if AUTOROLE_ID:
+        role = member.guild.get_role(AUTOROLE_ID)
+        if role:
+            try:
+                await member.add_roles(role, reason="Авто-роль при входе")
+            except Exception as e:
+                log.warning(f"Авто-роль: {e}")
+    # Приветствие
+    if WELCOME_CHANNEL_ID:
+        ch = member.guild.get_channel(WELCOME_CHANNEL_ID)
+        if ch:
+            emb = discord.Embed(
+                title="👋 Добро пожаловать!",
+                description=(
+                    f"Привет, {member.mention}!\n"
+                    f"Рады видеть тебя на **{member.guild.name}**.\n\n"
+                    f"Ознакомься с правилами и информацией о сервере."
+                ),
+                color=0x57F287,
+                timestamp=datetime.now(timezone.utc),
+            )
+            if member.display_avatar:
+                emb.set_thumbnail(url=member.display_avatar.url)
+            emb.set_footer(text=f"Участников: {member.guild.member_count}")
+            try:
+                await ch.send(embed=emb)
+            except Exception as e:
+                log.warning(f"Welcome: {e}")
 
 
 @bot.event
@@ -1327,6 +1550,353 @@ async def phrases_cmd(interaction: discord.Interaction):
     if len(phrases) > 40:
         text += f" … +{len(phrases)-40}"
     await interaction.response.send_message(f"**Фразы сканера ({len(phrases)}):**\n{text}", ephemeral=True)
+
+
+
+def _emoji_key(emoji) -> str:
+    """Нормализованный ключ эмодзи для хранения."""
+    if getattr(emoji, "id", None):
+        return f"{emoji.name}:{emoji.id}"
+    return str(emoji)
+
+
+
+@bot.tree.command(name="link", description="Привязать Steam-аккаунт")
+@app_commands.describe(steam="Ссылка на профиль, steamID64 или vanity URL")
+async def link_steam_cmd(interaction: discord.Interaction, steam: str):
+    parsed = parse_steam_input(steam)
+    if not parsed:
+        await interaction.response.send_message(
+            "❌ Не распознано. Пример:\n"
+            "`https://steamcommunity.com/profiles/76561198...`\n"
+            "или `76561198000000000`",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    sid = await resolve_steamid64(parsed)
+    if not sid:
+        if parsed.startswith("vanity:") and not STEAM_API_KEY:
+            await interaction.followup.send(
+                "❌ Для vanity-URL нужен `STEAM_API_KEY`. Укажите цифровой steamID64.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("❌ Не удалось получить steamID64.", ephemeral=True)
+        return
+    store.set_steam(interaction.user.id, sid)
+    bans_txt = ""
+    bans = await fetch_steam_bans(sid)
+    if bans:
+        vac = "да" if bans.get("VACBanned") else "нет"
+        bans_txt = f"\nVAC: **{vac}**, Game bans: **{bans.get('NumberOfGameBans', 0)}**"
+    await interaction.followup.send(
+        f"✅ Steam привязан: [{sid}](https://steamcommunity.com/profiles/{sid}){bans_txt}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="unlink", description="Отвязать Steam")
+async def unlink_steam_cmd(interaction: discord.Interaction):
+    if not store.get_steam(interaction.user.id):
+        await interaction.response.send_message("Steam не был привязан.", ephemeral=True)
+        return
+    store.data.get("steam_links", {}).pop(str(interaction.user.id), None)
+    store.save()
+    await interaction.response.send_message("✅ Steam отвязан.", ephemeral=True)
+
+
+@bot.tree.command(name="ratings", description="Средняя оценка стаффа по тикетам")
+@app_commands.describe(member="Сотрудник (по умолчанию вы)")
+async def ratings_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    if not _is_staff(interaction):
+        await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
+        return
+    target = member or interaction.user
+    n, avg = store.rating_stats(target.id)
+    if n == 0:
+        await interaction.response.send_message(f"У {target.mention} пока нет оценок.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"⭐ {target.mention}: **{avg:.2f}/5** ({n} оценок)",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="report", description="Пожаловаться на пользователя (создаёт тикет)")
+@app_commands.describe(user="На кого жалоба", reason="Причина жалобы")
+async def report_cmd(interaction: discord.Interaction, user: discord.Member, reason: str):
+    if store.is_blacklisted(interaction.user.id):
+        await interaction.response.send_message("❌ Вы в чёрном списке.", ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Нельзя пожаловаться на себя.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("❌ Нельзя жаловаться на бота.", ephemeral=True)
+        return
+    if store.count_open_tickets(interaction.user.id) >= TICKET_MAX_PER_USER:
+        await interaction.response.send_message(
+            f"❌ У вас уже есть открытый тикет (макс. {TICKET_MAX_PER_USER}).",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    staff_role = guild.get_role(ROLE_STAFF_ID)
+    cat = guild.get_channel(CATEGORY_TICKETS_ID)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        interaction.user: discord.PermissionOverwrite(
+            read_messages=True, send_messages=True, embed_links=True, attach_files=True
+        ),
+    }
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+    channel = await guild.create_text_channel(
+        name=f"ticket-жалоба-{interaction.user.name}",
+        category=cat,
+        overwrites=overwrites,
+    )
+
+    emb = discord.Embed(
+        title="📝 Жалоба на игрока",
+        description=(
+            f"**От:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+            f"**На:** {user.mention} (`{user.id}`)\n"
+            f"**Причина:** {reason}\n\n"
+            f"Опишите подробности и приложите доказательства (скрины)."
+        ),
+        color=0xCD5C5C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if user.display_avatar:
+        emb.set_thumbnail(url=user.display_avatar.url)
+
+    await channel.send(
+        content=f"{staff_role.mention if staff_role else ''}".strip() or None,
+        embed=emb,
+        view=TicketControlView(),
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    store.data["stats"]["tickets_opened"] = store.data["stats"].get("tickets_opened", 0) + 1
+    store.data["ticket_last_activity"][str(channel.id)] = now_iso
+    store.data["ticket_owners"][str(channel.id)] = interaction.user.id
+    store.data["ticket_opened_at"][str(channel.id)] = now_iso
+    store.save()
+
+    log_ch = guild.get_channel(LOG_CHANNEL_ID)
+    if log_ch:
+        await log_ch.send(embed=discord.Embed(
+            title="🟩 Тикет открыт (репорт)",
+            description=(
+                f"От: {interaction.user.mention}\n"
+                f"На: {user.mention}\n"
+                f"Канал: {channel.mention}\n"
+                f"Причина: {reason}"
+            ),
+            color=0x00FF00,
+        ))
+
+    await interaction.response.send_message(
+        f"✅ Жалоба создана: {channel.mention}",
+        ephemeral=True,
+    )
+
+
+# ---------- Reaction roles ----------
+
+@bot.tree.command(name="rr", description="Reaction roles: панель / привязка / список")
+@app_commands.describe(
+    action="create — сообщение-панель; add — привязать эмодзи→роль; remove — снять; list — список",
+    message_id="ID сообщения (для add/remove)",
+    emoji="Эмодзи (для add/remove)",
+    role="Роль (для add)",
+    text="Текст панели (для create)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="create", value="create"),
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="list", value="list"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def rr_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    message_id: str = "",
+    emoji: str = "",
+    role: discord.Role = None,
+    text: str = "Нажмите на реакцию, чтобы получить роль:",
+):
+    act = action.value
+    if act == "create":
+        emb = discord.Embed(
+            title="🎭 Роли по реакциям",
+            description=text,
+            color=0x5865F2,
+        )
+        emb.set_footer(text="ZXC • Reaction Roles")
+        msg = await interaction.channel.send(embed=emb)
+        store.data.setdefault("reaction_roles", {})[str(msg.id)] = {}
+        store.save()
+        await interaction.response.send_message(
+            f"✅ Панель создана. ID сообщения: `{msg.id}`\n"
+            f"Дальше: `/rr add message_id:{msg.id} emoji:✅ role:@Роль`",
+            ephemeral=True,
+        )
+        return
+
+    if act == "list":
+        rr = store.data.get("reaction_roles", {})
+        if not rr:
+            await interaction.response.send_message("Пусто — панелей нет.", ephemeral=True)
+            return
+        lines = []
+        for mid, mapping in list(rr.items())[:20]:
+            parts = [f"{em} → <@&{rid}>" for em, rid in mapping.items()]
+            lines.append(f"**msg `{mid}`:** " + (", ".join(parts) if parts else "(нет привязок)"))
+        await interaction.response.send_message("\n".join(lines) or "Пусто", ephemeral=True)
+        return
+
+    if not message_id.strip().isdigit():
+        await interaction.response.send_message("❌ Укажите числовой message_id.", ephemeral=True)
+        return
+    mid = int(message_id.strip())
+
+    if act == "remove":
+        if not emoji:
+            await interaction.response.send_message("❌ Укажите emoji.", ephemeral=True)
+            return
+        # Пробуем как есть и как unicode
+        key = emoji.strip()
+        ok = store.rr_unbind(mid, key)
+        if not ok:
+            # иногда кастом хранится name:id
+            for k in list(store.rr_get(mid).keys()):
+                if key in k or k in key:
+                    store.rr_unbind(mid, k)
+                    ok = True
+                    key = k
+                    break
+        await interaction.response.send_message(
+            f"{'✅ Снято' if ok else '⚠️ Не найдено'}: `{key}` с сообщения `{mid}`",
+            ephemeral=True,
+        )
+        return
+
+    # add
+    if not emoji or role is None:
+        await interaction.response.send_message("❌ Для add нужны emoji и role.", ephemeral=True)
+        return
+
+    key = emoji.strip()
+    # Если это кастомный эмодзи вида <:name:id>
+    m = re.match(r"<a?:(\w+):(\d+)>", key)
+    if m:
+        key = f"{m.group(1)}:{m.group(2)}"
+
+    store.rr_bind(mid, key, role.id)
+
+    # Ставим реакцию на сообщение
+    try:
+        channel = interaction.channel
+        msg = await channel.fetch_message(mid)
+    except Exception:
+        # попробуем найти в гильдии — только текущий канал
+        msg = None
+    if msg is None:
+        await interaction.response.send_message(
+            f"✅ Привязка сохранена (`{key}` → {role.mention}), но сообщение не найдено в этом канале — поставьте реакцию вручную.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        if m:
+            # partial emoji
+            em_obj = discord.PartialEmoji(name=m.group(1), id=int(m.group(2)))
+            await msg.add_reaction(em_obj)
+        else:
+            await msg.add_reaction(key)
+    except Exception as e:
+        await interaction.response.send_message(
+            f"✅ Привязка `{key}` → {role.mention} сохранена, но реакцию поставить не удалось: {e}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ `{key}` → {role.mention} на сообщении `{mid}`",
+        ephemeral=True,
+    )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None or payload.user_id == bot.user.id:
+        return
+    mapping = store.rr_get(payload.message_id)
+    if not mapping:
+        return
+    key = _emoji_key(payload.emoji)
+    role_id = mapping.get(key)
+    if role_id is None:
+        # fallback: только name для кастомных
+        if payload.emoji.id:
+            role_id = mapping.get(f"{payload.emoji.name}:{payload.emoji.id}")
+        if role_id is None:
+            role_id = mapping.get(str(payload.emoji))
+    if not role_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+    role = guild.get_role(int(role_id))
+    if not member or not role:
+        return
+    try:
+        await member.add_roles(role, reason="Reaction role")
+    except discord.Forbidden:
+        log.warning(f"RR: нет прав выдать {role} пользователю {member}")
+    except Exception as e:
+        log.warning(f"RR add error: {e}")
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None:
+        return
+    mapping = store.rr_get(payload.message_id)
+    if not mapping:
+        return
+    key = _emoji_key(payload.emoji)
+    role_id = mapping.get(key)
+    if role_id is None and payload.emoji.id:
+        role_id = mapping.get(f"{payload.emoji.name}:{payload.emoji.id}")
+    if role_id is None:
+        role_id = mapping.get(str(payload.emoji))
+    if not role_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+    role = guild.get_role(int(role_id))
+    if not member or not role:
+        return
+    try:
+        await member.remove_roles(role, reason="Reaction role removed")
+    except Exception as e:
+        log.warning(f"RR remove error: {e}")
 
 
 @bot.tree.command(name="faq_scwh", description="вся система поддержки")
