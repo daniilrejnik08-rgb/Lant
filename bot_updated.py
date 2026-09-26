@@ -20,7 +20,6 @@ except ImportError:
     pytesseract = None
     Image = None
     HAS_OCR = False
-    log.info("[ScamScanner] pytesseract/Pillow не установлены — OCR картинок отключён")
 
 # ====================== КОНФИГ ======================
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
@@ -84,6 +83,8 @@ DATA_FILE = "bot_data.json"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ZXCBot")
+if not HAS_OCR:
+    log.info("[ScamScanner] pytesseract/Pillow не установлены — OCR картинок отключён")
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 2000
