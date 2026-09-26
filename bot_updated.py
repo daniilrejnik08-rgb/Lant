@@ -1101,14 +1101,40 @@ bot = Bot()
 
 @bot.event
 async def on_ready():
-    print(f"[Bot] {bot.user.name} запущен")
+    print(f"[Bot] {bot.user.name} запущен | ID: {bot.user.id}")
     if bot.scam_scanner.ready:
-        print("[Bot] ScamScanner: активен")
+        print("[Bot] ScamScanner: OCR активен")
     else:
-        print("[Bot] ScamScanner: tessdata не найден")
-    guild = discord.Object(id=GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
+        print("[Bot] ScamScanner: OCR выключен (текст/ссылки работают)")
+
+    # Проверяем, видит ли бот сервер
+    g = bot.get_guild(GUILD_ID)
+    if g is None:
+        print(f"[Bot] ⚠️ Сервер GUILD_ID={GUILD_ID} не найден. "
+              f"Бот не на сервере или неверный ID. Гильдий в кэше: {len(bot.guilds)}")
+        for gg in bot.guilds:
+            print(f"       - {gg.name} ({gg.id})")
+    else:
+        print(f"[Bot] Сервер: {g.name} ({g.id})")
+
+    # Синхронизация slash-команд (не роняем бота при ошибке)
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"[Bot] Slash-команды синхронизированы: {len(synced)}")
+    except discord.Forbidden as e:
+        print(
+            "[Bot] ❌ Нет доступа к синхронизации команд (403 Missing Access).\n"
+            "     Решение:\n"
+            "     1) Перепригласите бота со scope: bot + applications.commands\n"
+            "        https://discord.com/oauth2/authorize?client_id=CLIENT_ID&permissions=8&scope=bot%20applications.commands\n"
+            "     2) Проверьте GUILD_ID в конфиге\n"
+            "     3) Убедитесь, что токен от того же приложения, что приглашено на сервер\n"
+            f"     Детали: {e}"
+        )
+    except Exception as e:
+        print(f"[Bot] ❌ Ошибка sync команд: {type(e).__name__}: {e}")
 
 
 @bot.event
