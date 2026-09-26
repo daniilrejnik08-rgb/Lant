@@ -9,10 +9,18 @@ import os
 import re
 import json
 from typing import NamedTuple, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 import aiohttp
-import pytesseract
-from PIL import Image
+
+try:
+    import pytesseract
+    from PIL import Image
+    HAS_OCR = True
+except ImportError:
+    pytesseract = None
+    Image = None
+    HAS_OCR = False
+    print("[ScamScanner] pytesseract/Pillow не установлены — OCR картинок отключён")
 
 # ====================== КОНФИГ ======================
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
@@ -22,12 +30,12 @@ ROLE_STAFF_ID = 1500474195211980977
 INFO_CHANNEL_ID = 1500861419363500032
 LOG_CHANNEL_ID = 1506392661454487822
 APPLICATIONS_LOG_CHANNEL_ID = 1513721222578311279
+AUDIT_CHANNEL_ID = 1506392661454487822
 
 BANNER_URL = "https://media.discordapp.net/attachments/1500474195623149764/1505932228461334609/zxc.png?ex=6a0c6c2e&is=6a0b1aae&hm=ece545622b439fef92262fb1d0b10bc2f5e84785a2613cdc7feae759e772f325&=&format=webp&quality=lossless"
 RUBANNER_URL = "https://media.discordapp.net/attachments/1500475963585073264/1512470605172179024/rules.jpg?ex=6a243584&is=6a22e404&hm=1b7c6e512e721bb1cf09568a00af6825bd27f55cc8492cbc5c65c5095110f16a&=&format=webp"
 SEPARATOR_URL = "https://media.discordapp.net/attachments/1500474195623149764/1505936040622424234/zxc2.png?ex=6a0c6fbb&is=6a0b1e3b&hm=0bdbd5aaee6b20782b84216208e4c6096d3fcbbe00edefc78e4b4f91080fd464&=&format=webp&quality=lossless"
 
-# SCAM SCANNER
 SCAM_NOTIFY_CHANNEL_ID = "1512557043477647550"
 SCAM_TESSDATA_PATH = os.getenv("TESSDATA_PREFIX", "/usr/share/tesseract-ocr/4.00/tessdata")
 SCAM_LANGUAGE = "eng+rus"
@@ -40,27 +48,37 @@ SCAM_PHRASES = [
 ]
 SCAM_LINK_BLACKLIST = [
     "t.me/", "telegram.me/", "bit.ly/", "cutt.ly/", "clck.ru/",
-    "goo.gl/", "tinyurl.com/", "discord.gg/",  # можно расширять
+    "goo.gl/", "tinyurl.com/",
 ]
-SCAM_MUTE_THRESHOLD = 3          # после скольких срабатываний — мут
-SCAM_MUTE_MINUTES = 60           # на сколько минут
+SCAM_MUTE_THRESHOLD = 3
+SCAM_MUTE_MINUTES = 60
 
-# Роли, при наличии которых нельзя открывать тикет
-PUNISHED_ROLE_IDS = [
-    # 1500000000000000000,  # пример: роль "Наказан" / "В бане"
-]
+PUNISHED_ROLE_IDS = []
 
-# Маппинг должности → ID роли (при принятии заявки)
 APPLICATION_ROLE_MAP = {
-    "CS:GO": None,           # поставь ID роли, если нужно авто-выдавать
+    "CS:GO": None,
     "CS2": None,
     "Discord Staff": None,
 }
 
-# Тикеты
-TICKET_INACTIVE_HOURS = 48       # автозакрытие через N часов без сообщений
-APPLICATION_COOLDOWN_DAYS = 7    # кулдаун на подачу заявки
-APPLICATION_STALE_HOURS = 72     # уведомление, если заявка висит дольше
+TICKET_INACTIVE_HOURS = 48
+TICKET_USER_REMIND_HOURS = 12
+TICKET_MAX_PER_USER = 1
+APPLICATION_COOLDOWN_DAYS = 7
+APPLICATION_STALE_HOURS = 72
+
+FLOOD_SAME_COUNT = 3
+FLOOD_WINDOW_SECONDS = 60
+FLOOD_MUTE_MINUTES = 10
+
+AUTO_REPLIES = {
+    "как зайти": f"Инструкция по подключению находится в <#{INFO_CHANNEL_ID}>. Если не помогло — откройте тикет.",
+    "ошибка подключения": f"Попробуйте: очистить DNS, отключить VPN/прокси, перезапустить игру. Подробнее: <#{INFO_CHANNEL_ID}>",
+    "не могу зайти": f"Смотрите канал <#{INFO_CHANNEL_ID}>. Если ничего не помогло — откройте тикет с скриншотом ошибки.",
+    "сайт не работает": "Очистите кэш браузера или попробуйте режим Инкогнито. Если ошибка остаётся — откройте тикет со скриншотом.",
+    "как подать апелляцию": "Выберите в меню тикетов пункт «Апелляция блокировки».",
+    "баг": "Нашли баг? Откройте тикет категории «Репорт-баг» и опишите шаги воспроизведения + скрин/видео.",
+}
 
 DATA_FILE = "bot_data.json"
 
@@ -71,15 +89,12 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 2000
 
 
-# ====================== ХРАНИЛИЩЕ ======================
-
 class DataStore:
-    """Простое JSON-хранилище (кулдауны, статистика, фразы)."""
     def __init__(self, path: str):
         self.path = path
         self.data = {
-            "application_cooldowns": {},   # user_id -> timestamp
-            "scam_strikes": {},            # user_id -> count
+            "application_cooldowns": {},
+            "scam_strikes": {},
             "scam_phrases": list(SCAM_PHRASES),
             "stats": {
                 "tickets_opened": 0,
@@ -88,10 +103,14 @@ class DataStore:
                 "applications_declined": 0,
                 "scam_caught": 0,
             },
-            "ticket_claims": {},          # channel_id -> staff_id
-            "ticket_last_activity": {},   # channel_id -> timestamp
+            "ticket_claims": {},
+            "ticket_last_activity": {},
+            "ticket_owners": {},
+            "ticket_opened_at": {},
+            "blacklist": [],
         }
         self.load()
+        self.flood: dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 
     def load(self):
         if os.path.exists(self.path):
@@ -112,7 +131,7 @@ class DataStore:
     def get_phrases(self) -> list:
         return self.data.get("scam_phrases", list(SCAM_PHRASES))
 
-    def add_phrase(self, phrase: str):
+    def add_phrase(self, phrase: str) -> bool:
         p = phrase.lower().strip()
         if p and p not in self.data["scam_phrases"]:
             self.data["scam_phrases"].append(p)
@@ -120,7 +139,7 @@ class DataStore:
             return True
         return False
 
-    def remove_phrase(self, phrase: str):
+    def remove_phrase(self, phrase: str) -> bool:
         p = phrase.lower().strip()
         if p in self.data["scam_phrases"]:
             self.data["scam_phrases"].remove(p)
@@ -128,11 +147,31 @@ class DataStore:
             return True
         return False
 
+    def is_blacklisted(self, user_id: int) -> bool:
+        return str(user_id) in self.data.get("blacklist", [])
+
+    def blacklist_add(self, user_id: int) -> bool:
+        uid = str(user_id)
+        if uid not in self.data["blacklist"]:
+            self.data["blacklist"].append(uid)
+            self.save()
+            return True
+        return False
+
+    def blacklist_remove(self, user_id: int) -> bool:
+        uid = str(user_id)
+        if uid in self.data["blacklist"]:
+            self.data["blacklist"].remove(uid)
+            self.save()
+            return True
+        return False
+
+    def count_open_tickets(self, user_id: int) -> int:
+        return sum(1 for uid in self.data.get("ticket_owners", {}).values() if int(uid) == user_id)
+
 
 store = DataStore(DATA_FILE)
 
-
-# ====================== SCAM IMAGE + TEXT SCANNER ======================
 
 class ImageRef(NamedTuple):
     url: str
@@ -146,14 +185,16 @@ class ScamImageScanner:
         self._semaphore = asyncio.Semaphore(2)
         self.bot = bot
         self.ready = False
-
-        tessdata_path = SCAM_TESSDATA_PATH
-        if tessdata_path and os.path.isdir(tessdata_path):
-            os.environ["TESSDATA_PREFIX"] = tessdata_path
-            self.ready = True
-            print(f"[ScamScanner] Запущен. Tessdata: {tessdata_path}")
+        if not HAS_OCR:
+            print("[ScamScanner] OCR недоступен (нет pytesseract/Pillow). Текстовый сканер активен.")
         else:
-            print(f"[ScamScanner] ОШИБКА: tessdata не найден по пути: {tessdata_path}")
+            tessdata_path = SCAM_TESSDATA_PATH
+            if tessdata_path and os.path.isdir(tessdata_path):
+                os.environ["TESSDATA_PREFIX"] = tessdata_path
+                self.ready = True
+                print(f"[ScamScanner] Запущен. Tessdata: {tessdata_path}")
+            else:
+                print(f"[ScamScanner] ОШИБКА: tessdata не найден: {tessdata_path}")
 
     @property
     def phrases(self) -> list:
@@ -170,7 +211,16 @@ class ScamImageScanner:
             if message.author.get_role(ROLE_STAFF_ID):
                 return
 
-        # 1. Проверка текста
+        if store.is_blacklisted(message.author.id):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
+        if await self._check_flood(message):
+            return
+
         text_matched = self._find_scam_phrase(message.content or "")
         link_matched = self._find_blacklisted_link(message.content or "")
         if text_matched or link_matched:
@@ -178,12 +228,42 @@ class ScamImageScanner:
             await self._handle_scam(message, None, reason, is_image=False)
             return
 
-        # 2. Проверка картинок
         if not self.ready:
             return
         images = self._collect_images(message)
         if images:
             asyncio.create_task(self._scan_message(message, images))
+
+    async def _check_flood(self, message: discord.Message) -> bool:
+        content = (message.content or "").strip().lower()
+        if len(content) < 3:
+            return False
+        uid = str(message.author.id)
+        now = datetime.now(timezone.utc).timestamp()
+        q = store.flood[uid]
+        q.append((now, content))
+        while q and now - q[0][0] > FLOOD_WINDOW_SECONDS:
+            q.popleft()
+        same = sum(1 for t, c in q if c == content)
+        if same >= FLOOD_SAME_COUNT:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            if isinstance(message.author, discord.Member):
+                try:
+                    until = datetime.now(timezone.utc) + timedelta(minutes=FLOOD_MUTE_MINUTES)
+                    await message.author.timeout(until, reason="Анти-флуд: одинаковые сообщения")
+                    notify = self.bot.get_channel(int(self.notify_channel_id))
+                    if notify:
+                        await notify.send(
+                            f"🔇 {message.author.mention} мут {FLOOD_MUTE_MINUTES} мин (флуд одинаковых сообщений)"
+                        )
+                except Exception:
+                    pass
+            store.flood[uid].clear()
+            return True
+        return False
 
     def _find_blacklisted_link(self, text: str) -> Optional[str]:
         lower = text.lower()
@@ -192,8 +272,8 @@ class ScamImageScanner:
                 return link
         return None
 
-    def _collect_images(self, message: discord.Message) -> list[ImageRef]:
-        result: list[ImageRef] = []
+    def _collect_images(self, message: discord.Message) -> list:
+        result = []
         self._add_attachments(result, message.attachments)
         for embed in message.embeds:
             self._add_embed_images(result, embed)
@@ -210,7 +290,7 @@ class ScamImageScanner:
         return result
 
     @staticmethod
-    def _add_embed_images(result: list[ImageRef], embed: discord.Embed) -> None:
+    def _add_embed_images(result, embed) -> None:
         if embed.image:
             url = embed.image.proxy_url or embed.image.url
             if url:
@@ -221,7 +301,7 @@ class ScamImageScanner:
                 result.append(ImageRef(url, "embed-thumb"))
 
     @staticmethod
-    def _add_attachments(result: list[ImageRef], attachments) -> None:
+    def _add_attachments(result, attachments) -> None:
         for a in attachments:
             if not a.content_type or not a.content_type.startswith("image/"):
                 continue
@@ -231,7 +311,7 @@ class ScamImageScanner:
             if url:
                 result.append(ImageRef(url, a.filename))
 
-    async def _scan_message(self, message: discord.Message, images: list[ImageRef]) -> None:
+    async def _scan_message(self, message, images) -> None:
         async with self._semaphore:
             for img in images:
                 try:
@@ -269,7 +349,7 @@ class ScamImageScanner:
             return None
 
     @staticmethod
-    def _resize_if_needed(src: Image.Image) -> Image.Image:
+    def _resize_if_needed(src):
         w, h = src.size
         max_dim = max(w, h)
         if max_dim <= MAX_IMAGE_DIMENSION:
@@ -277,7 +357,7 @@ class ScamImageScanner:
         scale = MAX_IMAGE_DIMENSION / max_dim
         return src.resize((round(w * scale), round(h * scale)), Image.BILINEAR)
 
-    def _recognize(self, img: Image.Image) -> str:
+    def _recognize(self, img) -> str:
         try:
             return pytesseract.image_to_string(img, config=self._tess_config)
         except Exception as e:
@@ -293,15 +373,13 @@ class ScamImageScanner:
                 return phrase
         return None
 
-    async def _handle_scam(self, message: discord.Message, img: Optional[ImageRef], phrase: str, is_image: bool = True) -> None:
+    async def _handle_scam(self, message, img, phrase: str, is_image: bool = True) -> None:
         try:
             await message.delete()
-        except discord.HTTPException as e:
-            print(f"[ScamScanner] Не удалось удалить сообщение: {e}")
+        except discord.HTTPException:
+            pass
 
         store.data["stats"]["scam_caught"] = store.data["stats"].get("scam_caught", 0) + 1
-
-        # Страйки
         uid = str(message.author.id)
         strikes = store.data["scam_strikes"].get(uid, 0) + 1
         store.data["scam_strikes"][uid] = strikes
@@ -330,7 +408,6 @@ class ScamImageScanner:
         except discord.HTTPException:
             pass
 
-        # Авто-мут при достижении порога
         if strikes >= SCAM_MUTE_THRESHOLD and isinstance(author, discord.Member):
             try:
                 until = datetime.now(timezone.utc) + timedelta(minutes=SCAM_MUTE_MINUTES)
@@ -340,13 +417,9 @@ class ScamImageScanner:
                 )
                 store.data["scam_strikes"][uid] = 0
                 store.save()
-            except discord.Forbidden:
+            except Exception:
                 pass
-            except Exception as e:
-                print(f"[ScamScanner] Не удалось выдать мут: {e}")
 
-
-# ====================== ЗАЯВКИ ======================
 
 class DeclineReasonModal(discord.ui.Modal, title="Причина отказа"):
     reason = discord.ui.TextInput(
@@ -357,7 +430,7 @@ class DeclineReasonModal(discord.ui.Modal, title="Причина отказа"):
         required=True,
     )
 
-    def __init__(self, review_view: "ApplicationReviewView"):
+    def __init__(self, review_view):
         super().__init__()
         self.review_view = review_view
 
@@ -388,7 +461,10 @@ class ApplicationModal(discord.ui.Modal, title="📋 Заявка на долж�
         self.role_choice = role_choice
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Кулдаун
+        if store.is_blacklisted(interaction.user.id):
+            await interaction.response.send_message("❌ Вы в чёрном списке.", ephemeral=True)
+            return
+
         uid = str(interaction.user.id)
         last = store.data["application_cooldowns"].get(uid)
         if last:
@@ -491,12 +567,10 @@ class ApplicationReviewView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(embed=new_embed, view=self)
 
-        # Статистика
         key = "applications_accepted" if accepted else "applications_declined"
         store.data["stats"][key] = store.data["stats"].get(key, 0) + 1
         store.save()
 
-        # Авто-выдача роли
         if accepted and self.role_choice:
             role_id = APPLICATION_ROLE_MAP.get(self.role_choice)
             if role_id and interaction.guild:
@@ -507,6 +581,8 @@ class ApplicationReviewView(discord.ui.View):
                         await member.add_roles(role, reason="Заявка принята")
                     except discord.Forbidden:
                         pass
+
+        await _audit(interaction.guild, f"{'✅ Принял' if accepted else '❌ Отклонил'} заявку", interaction.user, f"ID заявителя: {self.applicant_id}")
 
         applicant = interaction.client.get_user(self.applicant_id)
         if applicant:
@@ -527,19 +603,12 @@ class ApplicationReviewView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
+        msg = f"{'✅ Заявка принята' if accepted else '❌ Заявка отклонена'}. Заявитель уведомлён в ЛС."
         if not interaction.response.is_done():
-            await interaction.response.send_message(
-                f"{'✅ Заявка принята' if accepted else '❌ Заявка отклонена'}. Заявитель уведомлён в ЛС.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(msg, ephemeral=True)
         else:
-            await interaction.followup.send(
-                f"{'✅ Заявка принята' if accepted else '❌ Заявка отклонена'}. Заявитель уведомлён в ЛС.",
-                ephemeral=True,
-            )
+            await interaction.followup.send(msg, ephemeral=True)
 
-
-# ====================== ТИКЕТЫ ======================
 
 class TicketDropdown(discord.ui.Select):
     def __init__(self):
@@ -556,7 +625,10 @@ class TicketDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         guild, user = interaction.guild, interaction.user
 
-        # Проверка наказанных ролей
+        if store.is_blacklisted(user.id):
+            await interaction.response.send_message("❌ Вы в чёрном списке и не можете открывать тикеты.", ephemeral=True)
+            return
+
         if isinstance(user, discord.Member):
             for rid in PUNISHED_ROLE_IDS:
                 if user.get_role(rid):
@@ -565,6 +637,13 @@ class TicketDropdown(discord.ui.Select):
                         ephemeral=True,
                     )
                     return
+
+        if store.count_open_tickets(user.id) >= TICKET_MAX_PER_USER:
+            await interaction.response.send_message(
+                f"❌ У вас уже есть открытый тикет. Максимум: **{TICKET_MAX_PER_USER}**.",
+                ephemeral=True,
+            )
+            return
 
         staff_role = guild.get_role(ROLE_STAFF_ID)
         cat = guild.get_channel(CATEGORY_TICKETS_ID)
@@ -596,9 +675,11 @@ class TicketDropdown(discord.ui.Select):
         )
         await interaction.followup.send(f"Ваш тикет: {channel.mention}", ephemeral=True)
 
-        # Статистика + активность
+        now_iso = datetime.now(timezone.utc).isoformat()
         store.data["stats"]["tickets_opened"] = store.data["stats"].get("tickets_opened", 0) + 1
-        store.data["ticket_last_activity"][str(channel.id)] = datetime.now(timezone.utc).isoformat()
+        store.data["ticket_last_activity"][str(channel.id)] = now_iso
+        store.data["ticket_owners"][str(channel.id)] = user.id
+        store.data["ticket_opened_at"][str(channel.id)] = now_iso
         store.save()
 
         log_ch = guild.get_channel(LOG_CHANNEL_ID)
@@ -624,7 +705,7 @@ class AddMemberModal(discord.ui.Modal, title="Добавить участник�
         required=True,
     )
 
-    def __init__(self, channel: discord.TextChannel):
+    def __init__(self, channel):
         super().__init__()
         self.channel = channel
 
@@ -642,6 +723,7 @@ class AddMemberModal(discord.ui.Modal, title="Добавить участник�
                                            embed_links=True, attach_files=True)
         await interaction.response.send_message(f"✅ {member.mention} добавлен в тикет.", ephemeral=True)
         await self.channel.send(f"➕ {member.mention} был добавлен в тикет.")
+        await _audit(interaction.guild, "Добавил участника в тикет", interaction.user, f"{member} → {self.channel.name}")
 
 
 class TransferModal(discord.ui.Modal, title="Передать тикет"):
@@ -652,7 +734,7 @@ class TransferModal(discord.ui.Modal, title="Передать тикет"):
         required=True,
     )
 
-    def __init__(self, channel: discord.TextChannel):
+    def __init__(self, channel):
         super().__init__()
         self.channel = channel
 
@@ -670,6 +752,8 @@ class TransferModal(discord.ui.Modal, title="Передать тикет"):
         store.save()
         await interaction.response.send_message(f"✅ Тикет передан {member.mention}.", ephemeral=True)
         await self.channel.send(f"🔄 Тикет передан модератору {member.mention}.")
+        await _set_ticket_emoji(self.channel, "🟢")
+        await _audit(interaction.guild, "Передал тикет", interaction.user, f"→ {member} | {self.channel.name}")
 
 
 class TicketControlView(discord.ui.View):
@@ -678,6 +762,9 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_staff(interaction):
+            await interaction.response.send_message("❌ Закрывать тикет может только администрация.", ephemeral=True)
+            return
         await _close_ticket(interaction, reason="Закрыт кнопкой")
 
     @discord.ui.button(label="Взять тикет", style=discord.ButtonStyle.primary, emoji="✋", custom_id="claim_ticket")
@@ -689,20 +776,21 @@ class TicketControlView(discord.ui.View):
         store.data["ticket_claims"][cid] = interaction.user.id
         store.save()
         await interaction.response.send_message(f"✅ Тикет взят: {interaction.user.mention}")
-        # Обновляем эмбед если есть
+        await _set_ticket_emoji(interaction.channel, "🟢")
         try:
             async for msg in interaction.channel.history(limit=5, oldest_first=True):
                 if msg.embeds and msg.author == interaction.client.user:
                     emb = msg.embeds[0]
                     new_emb = discord.Embed(
                         title=emb.title,
-                        description=emb.description + f"\n\n**Взял:** {interaction.user.mention}",
+                        description=(emb.description or "") + f"\n\n**Взял:** {interaction.user.mention}",
                         color=emb.color or 0xCD5C5C,
                     )
                     await msg.edit(embed=new_emb)
                     break
         except Exception:
             pass
+        await _audit(interaction.guild, "Взял тикет", interaction.user, interaction.channel.name)
 
     @discord.ui.button(label="Добавить участника", style=discord.ButtonStyle.secondary, emoji="➕", custom_id="add_member_ticket")
     async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -718,6 +806,28 @@ class TicketControlView(discord.ui.View):
             return
         await interaction.response.send_modal(TransferModal(interaction.channel))
 
+    @discord.ui.button(label="Решено", style=discord.ButtonStyle.success, emoji="✅", custom_id="resolve_ticket")
+    async def resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_staff(interaction):
+            await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
+            return
+        await _set_ticket_emoji(interaction.channel, "✅")
+        await interaction.response.send_message("✅ Тикет помечен как **решённый**. Можно закрывать.", ephemeral=False)
+        try:
+            async for msg in interaction.channel.history(limit=5, oldest_first=True):
+                if msg.embeds and msg.author == interaction.client.user:
+                    emb = msg.embeds[0]
+                    new_emb = discord.Embed(
+                        title=emb.title,
+                        description=(emb.description or "") + "\n\n**Статус: ✅ Решено**",
+                        color=0x57F287,
+                    )
+                    await msg.edit(embed=new_emb)
+                    break
+        except Exception:
+            pass
+        await _audit(interaction.guild, "Пометил тикет как решённый", interaction.user, interaction.channel.name)
+
 
 def _is_staff(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
@@ -727,14 +837,52 @@ def _is_staff(interaction: discord.Interaction) -> bool:
     return False
 
 
+async def _set_ticket_emoji(channel, emoji: str):
+    name = channel.name
+    for e in ("🟢", "🔴", "✅", "⏰"):
+        if name.startswith(e + "-"):
+            name = name[len(e) + 1:]
+            break
+    if name.startswith("ticket-"):
+        new_name = f"{emoji}-{name}"
+    else:
+        new_name = f"{emoji}-ticket-{name}"
+    try:
+        await channel.edit(name=new_name[:100])
+    except Exception:
+        pass
+
+
+async def _audit(guild, action: str, user, details: str = ""):
+    if not guild:
+        return
+    ch = guild.get_channel(AUDIT_CHANNEL_ID)
+    if not ch:
+        return
+    emb = discord.Embed(
+        title="📝 Аудит",
+        description=f"**Действие:** {action}\n**Кто:** {user.mention} (`{user.id}`)\n**Детали:** {details or '—'}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        await ch.send(embed=emb)
+    except Exception:
+        pass
+
+
 async def _close_ticket(interaction: discord.Interaction, reason: str = ""):
     channel = interaction.channel
     guild = interaction.guild
 
-    # Транскрипт
+    try:
+        await channel.edit(name=f"closed-{reason[:20]}-{channel.name}"[:100])
+    except Exception:
+        pass
+
     transcript_lines = []
     try:
-        async for msg in channel.history(limit=300, oldest_first=True):
+        async for msg in channel.history(limit=400, oldest_first=True):
             ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
             content = msg.content or ""
             if msg.attachments:
@@ -742,7 +890,6 @@ async def _close_ticket(interaction: discord.Interaction, reason: str = ""):
             transcript_lines.append(f"[{ts}] {msg.author}: {content}")
     except Exception:
         pass
-
     transcript_text = "\n".join(transcript_lines) if transcript_lines else "Нет сообщений."
 
     log_ch = guild.get_channel(LOG_CHANNEL_ID)
@@ -757,18 +904,39 @@ async def _close_ticket(interaction: discord.Interaction, reason: str = ""):
             color=0xFF0000,
             timestamp=datetime.now(timezone.utc),
         )
-        # Если транскрипт короткий — в эмбед, иначе файл
         if len(transcript_text) < 1800:
             embed.add_field(name="Транскрипт", value=f"```\n{transcript_text[:1800]}\n```", inline=False)
             await log_ch.send(embed=embed)
         else:
-            file = discord.File(io.BytesIO(transcript_text.encode("utf-8")), filename=f"transcript-{channel.name}.txt")
+            file = discord.File(io.BytesIO(transcript_text.encode("utf-8")), filename=f"transcript-{channel.id}.txt")
             await log_ch.send(embed=embed, file=file)
 
+    owner_id = store.data.get("ticket_owners", {}).get(str(channel.id))
+    if owner_id:
+        owner = interaction.client.get_user(int(owner_id))
+        if owner:
+            try:
+                dm_emb = discord.Embed(
+                    title="📄 Ваш тикет закрыт",
+                    description=f"**Причина:** {reason or '—'}\n\nНиже — копия переписки.",
+                    color=0xCD5C5C,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                if len(transcript_text) < 1800:
+                    dm_emb.add_field(name="Транскрипт", value=f"```\n{transcript_text[:1800]}\n```", inline=False)
+                    await owner.send(embed=dm_emb)
+                else:
+                    f = discord.File(io.BytesIO(transcript_text.encode("utf-8")), filename="transcript.txt")
+                    await owner.send(embed=dm_emb, file=f)
+            except discord.Forbidden:
+                pass
+
     store.data["stats"]["tickets_closed"] = store.data["stats"].get("tickets_closed", 0) + 1
-    store.data["ticket_claims"].pop(str(channel.id), None)
-    store.data["ticket_last_activity"].pop(str(channel.id), None)
+    for key in ("ticket_claims", "ticket_last_activity", "ticket_owners", "ticket_opened_at"):
+        store.data[key].pop(str(channel.id), None)
     store.save()
+
+    await _audit(guild, "Закрыл тикет", interaction.user, f"{channel.name} | {reason}")
 
     if not interaction.response.is_done():
         await interaction.response.send_message("Тикет будет удалён через 5 секунд...", ephemeral=False)
@@ -780,8 +948,6 @@ async def _close_ticket(interaction: discord.Interaction, reason: str = ""):
     except discord.HTTPException:
         pass
 
-
-# ====================== БОТ ======================
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -798,10 +964,11 @@ class Bot(commands.Bot):
         self.add_view(ApplicationReviewView(applicant_id=0))
         self.auto_close_tickets.start()
         self.check_stale_applications.start()
+        self.user_reminders.start()
+        self.update_status.start()
 
     @tasks.loop(minutes=30)
     async def auto_close_tickets(self):
-        """Автозакрытие неактивных тикетов."""
         await self.wait_until_ready()
         guild = self.get_guild(GUILD_ID)
         if not guild:
@@ -810,25 +977,21 @@ class Bot(commands.Bot):
         if not cat or not isinstance(cat, discord.CategoryChannel):
             return
         now = datetime.now(timezone.utc)
-        for channel in cat.text_channels:
-            if not channel.name.startswith("ticket-"):
+        for channel in list(cat.text_channels):
+            if "ticket-" not in channel.name and not channel.name.startswith(("🟢", "🔴", "✅", "⏰")):
                 continue
             last = store.data["ticket_last_activity"].get(str(channel.id))
             if not last:
-                # Если нет записи — ставим сейчас, чтобы не закрыть сразу
                 store.data["ticket_last_activity"][str(channel.id)] = now.isoformat()
                 continue
             last_dt = datetime.fromisoformat(last)
             if now - last_dt > timedelta(hours=TICKET_INACTIVE_HOURS):
                 try:
-                    await channel.send(
-                        embed=discord.Embed(
-                            title="⏰ Тикет закрыт автоматически",
-                            description=f"Неактивен более {TICKET_INACTIVE_HOURS} часов.",
-                            color=0xFFAA00,
-                        )
-                    )
-                    # Транскрипт + удаление
+                    await channel.send(embed=discord.Embed(
+                        title="⏰ Тикет закрыт автоматически",
+                        description=f"Неактивен более {TICKET_INACTIVE_HOURS} часов.",
+                        color=0xFFAA00,
+                    ))
                     transcript_lines = []
                     async for msg in channel.history(limit=200, oldest_first=True):
                         ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
@@ -845,43 +1008,92 @@ class Bot(commands.Bot):
                             emb.add_field(name="Транскрипт", value=f"```\n{transcript_text[:1800]}\n```", inline=False)
                             await log_ch.send(embed=emb)
                         else:
-                            f = discord.File(io.BytesIO(transcript_text.encode()), filename=f"transcript-{channel.name}.txt")
+                            f = discord.File(io.BytesIO(transcript_text.encode()), filename=f"transcript-{channel.id}.txt")
                             await log_ch.send(embed=emb, file=f)
+
+                    owner_id = store.data.get("ticket_owners", {}).get(str(channel.id))
+                    if owner_id:
+                        owner = self.get_user(int(owner_id))
+                        if owner:
+                            try:
+                                await owner.send(embed=discord.Embed(
+                                    title="⏰ Тикет закрыт автоматически",
+                                    description=f"Тикет был закрыт из-за неактивности ({TICKET_INACTIVE_HOURS}ч).",
+                                    color=0xFFAA00,
+                                ))
+                            except Exception:
+                                pass
+
                     store.data["stats"]["tickets_closed"] = store.data["stats"].get("tickets_closed", 0) + 1
-                    store.data["ticket_claims"].pop(str(channel.id), None)
-                    store.data["ticket_last_activity"].pop(str(channel.id), None)
+                    for key in ("ticket_claims", "ticket_last_activity", "ticket_owners", "ticket_opened_at"):
+                        store.data[key].pop(str(channel.id), None)
                     store.save()
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
                     await channel.delete()
                 except Exception as e:
                     log.error(f"Автозакрытие {channel.id}: {e}")
 
     @tasks.loop(hours=6)
     async def check_stale_applications(self):
-        """Уведомление о старых заявках."""
         await self.wait_until_ready()
         log_channel = self.get_channel(APPLICATIONS_LOG_CHANNEL_ID)
         if not log_channel:
             return
         try:
-            async for msg in log_channel.history(limit=50):
+            async for msg in log_channel.history(limit=30):
                 if not msg.embeds or not msg.components:
                     continue
                 emb = msg.embeds[0]
                 if "Новая заявка" not in (emb.title or ""):
                     continue
-                # Если кнопки ещё активны и прошло много времени
                 age = datetime.now(timezone.utc) - (emb.timestamp or msg.created_at)
                 if age > timedelta(hours=APPLICATION_STALE_HOURS):
-                    # Проверяем, не отправляли ли уже пинг
-                    if any("давно ожидает" in (r.content or "") for r in (await msg.channel.history(limit=5).flatten() if False else [])):
-                        continue
                     await log_channel.send(
-                        f"⚠️ Заявка от {emb.fields[0].value if emb.fields else '?'} "
-                        f"ожидает рассмотрения уже **{int(age.total_seconds() // 3600)}** часов.\n{msg.jump_url}"
+                        f"⚠️ Заявка ожидает рассмотрения уже **{int(age.total_seconds() // 3600)}** ч.\n{msg.jump_url}"
                     )
         except Exception as e:
             log.error(f"check_stale_applications: {e}")
+
+    @tasks.loop(hours=1)
+    async def user_reminders(self):
+        await self.wait_until_ready()
+        guild = self.get_guild(GUILD_ID)
+        if not guild:
+            return
+        cat = guild.get_channel(CATEGORY_TICKETS_ID)
+        if not cat:
+            return
+        now = datetime.now(timezone.utc)
+        for channel in cat.text_channels:
+            last = store.data["ticket_last_activity"].get(str(channel.id))
+            if not last:
+                continue
+            last_dt = datetime.fromisoformat(last)
+            if now - last_dt < timedelta(hours=TICKET_USER_REMIND_HOURS):
+                continue
+            try:
+                already = False
+                async for msg in channel.history(limit=3):
+                    if msg.author == self.user and "Вы ещё здесь?" in (msg.content or ""):
+                        already = True
+                        break
+                if not already:
+                    owner_id = store.data.get("ticket_owners", {}).get(str(channel.id))
+                    mention = f"<@{owner_id}>" if owner_id else ""
+                    await channel.send(f"{mention} 👋 Вы ещё здесь? Если вопрос решён — напишите, тикет можно закрыть.")
+            except Exception:
+                pass
+
+    @tasks.loop(minutes=5)
+    async def update_status(self):
+        await self.wait_until_ready()
+        open_count = len(store.data.get("ticket_owners", {}))
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name=f"тикетов: {open_count}",
+            )
+        )
 
 
 bot = Bot()
@@ -893,7 +1105,7 @@ async def on_ready():
     if bot.scam_scanner.ready:
         print("[Bot] ScamScanner: активен")
     else:
-        print("[Bot] ScamScanner: tessdata не найден, сканер отключён")
+        print("[Bot] ScamScanner: tessdata не найден")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
@@ -901,31 +1113,50 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Обновляем активность тикета
-    if message.guild and message.channel.name and message.channel.name.startswith("ticket-"):
-        store.data["ticket_last_activity"][str(message.channel.id)] = datetime.now(timezone.utc).isoformat()
-        # Не сохраняем на каждое сообщение — только периодически, но для простоты сохраняем
-        if not message.author.bot:
-            store.save()
+    if message.guild and message.channel.name:
+        is_ticket = (
+            "ticket-" in message.channel.name
+            or message.channel.name.startswith(("🟢", "🔴", "✅", "⏰", "closed-"))
+        )
+        if is_ticket:
+            store.data["ticket_last_activity"][str(message.channel.id)] = datetime.now(timezone.utc).isoformat()
+            if not message.author.bot:
+                store.save()
+            if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
 
-        # Удаляем системные сообщения Discord (join/leave и т.п. в тикетах)
-        if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
-            try:
-                await message.delete()
-            except Exception:
-                pass
+    if (
+        not message.author.bot
+        and message.guild
+        and message.content
+        and not (message.channel.name and ("ticket-" in message.channel.name or message.channel.name.startswith(("🟢", "🔴", "✅", "⏰"))))
+    ):
+        lower = message.content.lower()
+        for key, reply in AUTO_REPLIES.items():
+            if key in lower:
+                try:
+                    await message.reply(reply, mention_author=False)
+                except Exception:
+                    pass
+                break
 
     await bot.scam_scanner.on_message_received(message)
     await bot.process_commands(message)
 
 
-# ---------- Команды стаффа ----------
+def _is_ticket_channel(channel) -> bool:
+    name = getattr(channel, "name", "") or ""
+    return "ticket-" in name or name.startswith(("🟢", "🔴", "✅", "⏰", "closed-"))
+
 
 @bot.tree.command(name="close", description="Закрыть текущий тикет с причиной")
 @app_commands.describe(reason="Причина закрытия")
 async def close_cmd(interaction: discord.Interaction, reason: str = "Закрыт командой"):
-    if not interaction.channel.name.startswith("ticket-"):
-        await interaction.response.send_message("❌ Эта команда работает только в тикетах.", ephemeral=True)
+    if not _is_ticket_channel(interaction.channel):
+        await interaction.response.send_message("❌ Только в тикетах.", ephemeral=True)
         return
     if not _is_staff(interaction):
         await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
@@ -934,17 +1165,39 @@ async def close_cmd(interaction: discord.Interaction, reason: str = "Закры�
 
 
 @bot.tree.command(name="rename", description="Переименовать текущий тикет")
-@app_commands.describe(new_name="Новое имя (без ticket-)")
+@app_commands.describe(new_name="Новое имя (без префиксов)")
 async def rename_cmd(interaction: discord.Interaction, new_name: str):
-    if not interaction.channel.name.startswith("ticket-"):
+    if not _is_ticket_channel(interaction.channel):
         await interaction.response.send_message("❌ Только в тикетах.", ephemeral=True)
         return
     if not _is_staff(interaction):
         await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
         return
-    clean = re.sub(r"[^a-zA-Zа-яА-Я0-9\-_]", "", new_name)[:80]
+    clean = re.sub(r"[^a-zA-Zа-яА-Я0-9\-_]", "", new_name)[:70]
     await interaction.channel.edit(name=f"ticket-{clean}")
-    await interaction.response.send_message(f"✅ Тикет переименован в `ticket-{clean}`", ephemeral=True)
+    await interaction.response.send_message(f"✅ Переименован в `ticket-{clean}`", ephemeral=True)
+
+
+@bot.tree.command(name="ticket", description="Информация о текущем тикете")
+async def ticket_info(interaction: discord.Interaction):
+    if not _is_ticket_channel(interaction.channel):
+        await interaction.response.send_message("❌ Только в тикетах.", ephemeral=True)
+        return
+    cid = str(interaction.channel.id)
+    owner_id = store.data.get("ticket_owners", {}).get(cid)
+    claim_id = store.data.get("ticket_claims", {}).get(cid)
+    opened = store.data.get("ticket_opened_at", {}).get(cid)
+    last = store.data.get("ticket_last_activity", {}).get(cid)
+
+    emb = discord.Embed(title="ℹ️ Информация о тикете", color=0xCD5C5C)
+    emb.add_field(name="Канал", value=interaction.channel.mention, inline=True)
+    emb.add_field(name="Владелец", value=f"<@{owner_id}>" if owner_id else "—", inline=True)
+    emb.add_field(name="Взял", value=f"<@{claim_id}>" if claim_id else "Никто", inline=True)
+    if opened:
+        emb.add_field(name="Открыт", value=f"<t:{int(datetime.fromisoformat(opened).timestamp())}:R>", inline=True)
+    if last:
+        emb.add_field(name="Активность", value=f"<t:{int(datetime.fromisoformat(last).timestamp())}:R>", inline=True)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
 @bot.tree.command(name="stats", description="Статистика бота")
@@ -953,22 +1206,56 @@ async def stats_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
         return
     s = store.data.get("stats", {})
-    embed = discord.Embed(
-        title="📊 Статистика",
-        color=0xCD5C5C,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Тикеты открыто", value=str(s.get("tickets_opened", 0)), inline=True)
+    open_count = len(store.data.get("ticket_owners", {}))
+    bl_count = len(store.data.get("blacklist", []))
+    embed = discord.Embed(title="📊 Статистика", color=0xCD5C5C, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Тикеты открыто (всего)", value=str(s.get("tickets_opened", 0)), inline=True)
     embed.add_field(name="Тикеты закрыто", value=str(s.get("tickets_closed", 0)), inline=True)
+    embed.add_field(name="Сейчас открыто", value=str(open_count), inline=True)
     embed.add_field(name="Заявки принято", value=str(s.get("applications_accepted", 0)), inline=True)
     embed.add_field(name="Заявки отклонено", value=str(s.get("applications_declined", 0)), inline=True)
     embed.add_field(name="Скам поймано", value=str(s.get("scam_caught", 0)), inline=True)
-    embed.add_field(name="Активных тикетов", value=str(len(store.data.get("ticket_last_activity", {}))), inline=True)
+    embed.add_field(name="Чёрный список", value=str(bl_count), inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="blacklist", description="Управление чёрным списком")
+@app_commands.describe(action="add / remove / list", user="Пользователь")
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="list", value="list"),
+])
+async def blacklist_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], user: discord.User = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+    act = action.value
+    if act == "list":
+        bl = store.data.get("blacklist", [])
+        text = ", ".join(f"`{uid}`" for uid in bl[:30]) or "пусто"
+        await interaction.response.send_message(f"**Чёрный список ({len(bl)}):**\n{text}", ephemeral=True)
+        return
+    if not user:
+        await interaction.response.send_message("Укажите пользователя.", ephemeral=True)
+        return
+    if act == "add":
+        ok = store.blacklist_add(user.id)
+        await interaction.response.send_message(
+            f"{'✅ Добавлен в ЧС' if ok else '⚠️ Уже в ЧС'}: {user.mention}",
+            ephemeral=True,
+        )
+        await _audit(interaction.guild, "Добавил в чёрный список", interaction.user, str(user))
+    else:
+        ok = store.blacklist_remove(user.id)
+        await interaction.response.send_message(
+            f"{'✅ Убран из ЧС' if ok else '⚠️ Не был в ЧС'}: {user.mention}",
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="scam", description="Управление сканером")
-@app_commands.describe(action="Действие", phrase="Фраза")
+@app_commands.describe(action="Действие", phrase="Фраза", user="Для reset_strikes")
 @app_commands.choices(action=[
     app_commands.Choice(name="add_phrase", value="add"),
     app_commands.Choice(name="remove_phrase", value="remove"),
@@ -985,24 +1272,18 @@ async def scam_cmd(interaction: discord.Interaction, action: app_commands.Choice
             await interaction.response.send_message("Укажите фразу.", ephemeral=True)
             return
         ok = store.add_phrase(phrase)
-        await interaction.response.send_message(
-            f"{'✅ Добавлено' if ok else '⚠️ Уже есть'}: `{phrase.lower().strip()}`",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"{'✅ Добавлено' if ok else '⚠️ Уже есть'}: `{phrase.lower().strip()}`", ephemeral=True)
     elif act == "remove":
         if not phrase:
             await interaction.response.send_message("Укажите фразу.", ephemeral=True)
             return
         ok = store.remove_phrase(phrase)
-        await interaction.response.send_message(
-            f"{'✅ Удалено' if ok else '⚠️ Не найдено'}: `{phrase.lower().strip()}`",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"{'✅ Удалено' if ok else '⚠️ Не найдено'}: `{phrase.lower().strip()}`", ephemeral=True)
     elif act == "list":
         phrases = store.get_phrases()
         text = ", ".join(f"`{p}`" for p in phrases[:50])
         if len(phrases) > 50:
-            text += f" … и ещё {len(phrases)-50}"
+            text += f" … +{len(phrases)-50}"
         await interaction.response.send_message(f"**Фразы ({len(phrases)}):**\n{text}", ephemeral=True)
     elif act == "reset":
         if not user:
@@ -1013,7 +1294,17 @@ async def scam_cmd(interaction: discord.Interaction, action: app_commands.Choice
         await interaction.response.send_message(f"✅ Страйки {user.mention} сброшены.", ephemeral=True)
 
 
-# ---------- Админ-команды (визуал не трогаем) ----------
+@bot.tree.command(name="phrases", description="Список фраз сканера (для модераторов)")
+async def phrases_cmd(interaction: discord.Interaction):
+    if not _is_staff(interaction):
+        await interaction.response.send_message("❌ Только для стаффа.", ephemeral=True)
+        return
+    phrases = store.get_phrases()
+    text = ", ".join(f"`{p}`" for p in phrases[:40])
+    if len(phrases) > 40:
+        text += f" … +{len(phrases)-40}"
+    await interaction.response.send_message(f"**Фразы сканера ({len(phrases)}):**\n{text}", ephemeral=True)
+
 
 @bot.tree.command(name="faq_scwh", description="вся система поддержки")
 @app_commands.checks.has_permissions(administrator=True)
