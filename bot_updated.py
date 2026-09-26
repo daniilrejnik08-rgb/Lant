@@ -20,7 +20,7 @@ except ImportError:
     pytesseract = None
     Image = None
     HAS_OCR = False
-    print("[ScamScanner] pytesseract/Pillow не установлены — OCR картинок отключён")
+    log.info("[ScamScanner] pytesseract/Pillow не установлены — OCR картинок отключён")
 
 # ====================== КОНФИГ ======================
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
@@ -186,15 +186,15 @@ class ScamImageScanner:
         self.bot = bot
         self.ready = False
         if not HAS_OCR:
-            print("[ScamScanner] OCR недоступен (нет pytesseract/Pillow). Текстовый сканер активен.")
+            log.info("[ScamScanner] OCR недоступен (нет pytesseract/Pillow). Текстовый сканер активен.")
         else:
             tessdata_path = SCAM_TESSDATA_PATH
             if tessdata_path and os.path.isdir(tessdata_path):
                 os.environ["TESSDATA_PREFIX"] = tessdata_path
                 self.ready = True
-                print(f"[ScamScanner] Запущен. Tessdata: {tessdata_path}")
+                log.info(f"[ScamScanner] Запущен. Tessdata: {tessdata_path}")
             else:
-                print(f"[ScamScanner] ОШИБКА: tessdata не найден: {tessdata_path}")
+                log.info(f"[ScamScanner] ОШИБКА: tessdata не найден: {tessdata_path}")
 
     @property
     def phrases(self) -> list:
@@ -326,7 +326,7 @@ class ScamImageScanner:
                         await self._handle_scam(message, img, matched, is_image=True)
                         return
                 except Exception as e:
-                    print(f"[ScamScanner] Ошибка: {e}")
+                    log.info(f"[ScamScanner] Ошибка: {e}")
 
     async def _download_image(self, url: str):
         headers = {
@@ -345,7 +345,7 @@ class ScamImageScanner:
             img.load()
             return self._resize_if_needed(img)
         except Exception as e:
-            print(f"[ScamScanner] Ошибка загрузки: {e}")
+            log.info(f"[ScamScanner] Ошибка загрузки: {e}")
             return None
 
     @staticmethod
@@ -361,7 +361,7 @@ class ScamImageScanner:
         try:
             return pytesseract.image_to_string(img, config=self._tess_config)
         except Exception as e:
-            print(f"[ScamScanner] OCR упал: {e}")
+            log.info(f"[ScamScanner] OCR упал: {e}")
             return ""
 
     def _find_scam_phrase(self, text: str):
@@ -1101,40 +1101,36 @@ bot = Bot()
 
 @bot.event
 async def on_ready():
-    print(f"[Bot] {bot.user.name} запущен | ID: {bot.user.id}")
+    log.info(f"[Bot] {bot.user.name} запущен | ID: {bot.user.id}")
     if bot.scam_scanner.ready:
-        print("[Bot] ScamScanner: OCR активен")
+        log.info("[Bot] ScamScanner: OCR активен")
     else:
-        print("[Bot] ScamScanner: OCR выключен (текст/ссылки работают)")
+        log.info("[Bot] ScamScanner: OCR выключен (текст/ссылки работают)")
 
-    # Проверяем, видит ли бот сервер
     g = bot.get_guild(GUILD_ID)
     if g is None:
-        print(f"[Bot] ⚠️ Сервер GUILD_ID={GUILD_ID} не найден. "
-              f"Бот не на сервере или неверный ID. Гильдий в кэше: {len(bot.guilds)}")
+        log.warning(
+            f"[Bot] Сервер GUILD_ID={GUILD_ID} не найден. "
+            f"Бот не на сервере или неверный ID. Гильдий в кэше: {len(bot.guilds)}"
+        )
         for gg in bot.guilds:
-            print(f"       - {gg.name} ({gg.id})")
+            log.warning(f"       - {gg.name} ({gg.id})")
     else:
-        print(f"[Bot] Сервер: {g.name} ({g.id})")
+        log.info(f"[Bot] Сервер: {g.name} ({g.id})")
 
-    # Синхронизация slash-команд (не роняем бота при ошибке)
     try:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
-        print(f"[Bot] Slash-команды синхронизированы: {len(synced)}")
+        log.info(f"[Bot] Slash-команды синхронизированы: {len(synced)}")
     except discord.Forbidden as e:
-        print(
-            "[Bot] ❌ Нет доступа к синхронизации команд (403 Missing Access).\n"
-            "     Решение:\n"
-            "     1) Перепригласите бота со scope: bot + applications.commands\n"
-            "        https://discord.com/oauth2/authorize?client_id=CLIENT_ID&permissions=8&scope=bot%20applications.commands\n"
-            "     2) Проверьте GUILD_ID в конфиге\n"
-            "     3) Убедитесь, что токен от того же приложения, что приглашено на сервер\n"
-            f"     Детали: {e}"
+        log.error(
+            "[Bot] Нет доступа к синхронизации команд (403 Missing Access). "
+            "Перепригласите бота со scope bot + applications.commands. "
+            f"Детали: {e}"
         )
     except Exception as e:
-        print(f"[Bot] ❌ Ошибка sync команд: {type(e).__name__}: {e}")
+        log.error(f"[Bot] Ошибка sync команд: {type(e).__name__}: {e}")
 
 
 @bot.event
